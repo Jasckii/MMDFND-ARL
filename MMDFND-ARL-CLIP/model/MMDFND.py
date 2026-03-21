@@ -807,7 +807,12 @@ class Trainer():
                  save_param_dir,
                  loss_weight=[1, 0.006, 0.009, 5e-5],
                  early_stop=5,
-                 epoches=100
+                 epoches=100,
+                 # --- [修改片段 6 新增]: 接收外部參數 ---
+                 arl_gamma=0.6,
+                 arl_T=2.0,
+                 pkl_name='parameter_mmdfnd.pkl'
+                 # ---------------------------------
                  ):
         self.lr = lr
         self.weight_decay = weight_decay
@@ -819,7 +824,11 @@ class Trainer():
         self.category_dict = category_dict
         self.loss_weight = loss_weight
         self.use_cuda = use_cuda
-
+        # --- [修改片段 7 新增]: 綁定到實例變數 ---
+        self.arl_gamma = arl_gamma
+        self.arl_T = arl_T
+        self.pkl_name = pkl_name
+        # -----------------------------------
         self.emb_dim = emb_dim
         self.mlp_dims = mlp_dims
         self.bert = bert
@@ -882,12 +891,10 @@ class Trainer():
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.98)
         recorder = Recorder(self.early_stop)
         
-        # 定义 ARL 温度系数
-        arl_T = 2.0 #2%%4%%6%%8
-        
-        # 定义 gamma，建议从 0.5 或 1.0
-        # 相比原来的 0.14，这会强迫单模态学得更好
-        arl_gamma = 0.6
+        # --- [修改片段 8 修改]: 替換原本寫死的變數 ---
+        arl_T = self.arl_T 
+        arl_gamma = self.arl_gamma
+        # ----------------------------------------
         
         for epoch in range(self.epoches):
             self.model.train()
@@ -1010,12 +1017,16 @@ class Trainer():
             mark = recorder.add(results0)
             if mark == 'save':
                 torch.save(self.model.state_dict(),
-                           os.path.join(self.save_param_dir, 'parameter_mmdfnd.pkl'))
+                           # --- [修改片段 9 修改]: 使用動態命名的 pkl ---
+                           os.path.join(self.save_param_dir, self.pkl_name))
+                           # -----------------------------------------
             elif mark == 'esc':
                 break
             else:
                 continue
-        self.model.load_state_dict(torch.load(os.path.join(self.save_param_dir, 'parameter_mmdfnd.pkl')))
+        # --- [修改片段 10 修改]: 載入時同樣使用動態命名的 pkl ---
+        self.model.load_state_dict(torch.load(os.path.join(self.save_param_dir, self.pkl_name)))
+        # ----------------------------------------------------
         results0,results1,results2,results3 = self.test(self.test_loader)
         print(results0)
         return results0, os.path.join(self.save_param_dir, 'parameter_clip111.pkl')
