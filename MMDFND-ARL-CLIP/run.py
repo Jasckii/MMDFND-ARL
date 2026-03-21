@@ -1,3 +1,4 @@
+import csv
 import os
 from utils.clip_dataloader import bert_data as weibo_data
 from utils.weibo21_clip_dataloader import bert_data as weibo21_data
@@ -19,6 +20,12 @@ class Run():
         self.num_workers = config['num_workers']
         self.vocab_file = config['vocab_file']
         self.early_stop = config['early_stop']
+        # --- [修改片段 3 新增]: 獲取網格搜索參數，並定義 pkl 檔名 ---
+        self.gamma = config['gamma']
+        self.T = config['T']
+        self.save_csv = config['save_csv']
+        self.pkl_name = f"model_gamma{self.gamma}_T{self.T}_es{self.early_stop}.pkl"
+        # ------------------------------------------------------
         self.bert = config['bert']
         self.root_path = config['root_path']
         self.mlp_dims = config['model']['mlp']['dims']
@@ -94,5 +101,22 @@ class Run():
                                     use_cuda=self.use_cuda, lr=self.lr, train_loader=train_loader, dropout=self.dropout,
                                     weight_decay=self.weight_decay, val_loader=val_loader, test_loader=test_loader,
                                     category_dict=self.category_dict, early_stop=self.early_stop, epoches=self.epoch,
-                                    save_param_dir=os.path.join(self.save_param_dir, self.model_name))
-        trainer.train()
+                                    save_param_dir=os.path.join(self.save_param_dir, self.model_name),
+                                    # --- [修改片段 4 新增]: 傳遞參數給 Trainer ---
+                                    arl_gamma=self.gamma,
+                                    arl_T=self.T,
+                                    pkl_name=self.pkl_name)
+                                    # ------------------------------------------
+            
+        # --- [修改片段 5 修改]: 接收訓練結果並寫入 CSV ---
+        results0, _ = trainer.train()
+        
+        file_exists = os.path.isfile(self.save_csv)
+        with open(self.save_csv, mode='a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                # 若檔案不存在，寫入表頭
+                writer.writerow(['gamma', 'T', 'early_stop', 'test_results'])
+            # 寫入當前這組參數的測試結果
+            writer.writerow([self.gamma, self.T, self.early_stop, str(results0)])
+        # ----------------------------------------------
