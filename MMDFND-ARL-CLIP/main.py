@@ -7,12 +7,17 @@ import os
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_name', default='MMDFND')
-parser.add_argument('--dataset', default='weibo21')#weibo21 %% weibo
+parser.add_argument('--dataset', default='weibo')#weibo21 %% weibo
 #parser.add_argument('--model_name', default='domain_ple6')
 parser.add_argument('--epoch', type=int, default=50)
 parser.add_argument('--max_len', type=int, default=197)
 parser.add_argument('--num_workers', type=int, default=4)#4%%8
 parser.add_argument('--early_stop', type=int, default=6)
+# --- [修改片段 1 新增]: ARL 與 CSV 記錄的命令行參數 ---
+parser.add_argument('--gamma', type=float, default=0.6, help='ARL gamma param')
+parser.add_argument('--T', type=float, default=2.0, help='ARL Temperature param')
+parser.add_argument('--save_csv', default='grid_search_results.csv', help='CSV file to save results')
+# ---------------------------------------------------
 parser.add_argument('--bert_vocab_file', default='./pretrained_model/chinese_roberta_wwm_base_ext_pytorch/vocab.txt')
 #parser.add_argument('--root_path', default='./Weibo_21/')
 parser.add_argument('--root_path', default='./data/')
@@ -63,6 +68,11 @@ config = {
         'batchsize': args.batchsize,
         'max_len': args.max_len,
         'early_stop': args.early_stop,
+        # --- [修改片段 2 新增]: 將參數加入 config ---
+        'gamma': args.gamma,
+        'T': args.T,
+        'save_csv': args.save_csv,
+        # ----------------------------------------
         'num_workers': args.num_workers,
         'vocab_file': vocab_file,
         'emb_type': args.emb_type,
