@@ -988,6 +988,14 @@ class Trainer():
                             print(f"  > Reliability Weights (Variance-based) | Text: {w_t_norm:.4f} | Image: {w_i_norm:.4f}")
                             print(f"  > Final Gradient Weights (Softmax)     | Text: {weights[0].item():.4f} | Image: {weights[1].item():.4f}")
                             print("-" * 60)
+                
+                # --- 【核心修复：防止过度自信导致 BCELoss 梯度除以 0 产生 NaN】 ---
+                final_label_pred_list = torch.clamp(final_label_pred_list, min=1e-5, max=1.0 - 1e-5)
+                fusion_label_pred_list = torch.clamp(fusion_label_pred_list, min=1e-5, max=1.0 - 1e-5)
+                image_label_pred_list = torch.clamp(image_label_pred_list, min=1e-5, max=1.0 - 1e-5)
+                text_label_pred_list = torch.clamp(text_label_pred_list, min=1e-5, max=1.0 - 1e-5)
+                # -----------------------------------------------------------
+                
                 #-------------------------------原损失逻辑--------------------------------
                 loss0 = loss_fn(final_label_pred_list, batch_label.float())
                 loss1 = loss_fn(fusion_label_pred_list, batch_label.float())
