@@ -4,8 +4,8 @@ import os
 
 def main():
     # 1. 定義網格搜索參數
-    gammas = [0.2, 0.4, 0.6, 0.8]
-    Ts = [2, 4, 6, 8]
+    gammas = [1.5, 0.8, 1.0]
+    Ts = [0.5, 1.2, 0.8, 1.0]
     early_stops = [4, 6, 8]
     
     csv_filename = "grid_search_results.csv"
