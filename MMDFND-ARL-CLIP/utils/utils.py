@@ -1,11 +1,7 @@
-# -*-codeing = utf-8 -*-
-# @Time : 2023-12-121:07
-# @Author : 童宇
-# @File : utils.py
-# @software :
 import torch
-from sklearn.metrics import recall_score, precision_score, f1_score, accuracy_score, roc_auc_score
 import numpy as np
+from sklearn.metrics import recall_score, precision_score, f1_score, accuracy_score, roc_auc_score
+
 def clipdata2gpu(batch):
     batch_data = {
         'content': batch[0].cuda(),
@@ -17,6 +13,139 @@ def clipdata2gpu(batch):
         'clip_text': batch[6].cuda()
     }
     return batch_data
+
+class Averager():
+    def __init__(self):
+        self.n = 0
+        self.v = 0
+    def add(self, x):
+        self.v = (self.v * self.n + x) / (self.n + 1)
+        self.n += 1
+    def item(self):
+        return self.v
+
+# =====================================================================
+# 核心指标计算 (支持 Validation 搜索与 Test 盲测)
+# =====================================================================
+def metrics(y_true, y_pred_prob, category, category_dict, is_test=False, thresholds_dict=None):
+    res_by_category = {}
+    metrics_by_category = {}
+    reverse_category_dict = {v: k for k, v in category_dict.items()}
+    
+    for k in category_dict.keys():
+        res_by_category[k] = {"y_true": [], "y_pred_prob": [], "indices": []}
+
+    for i, c in enumerate(category):
+        c_name = reverse_category_dict[c]
+        res_by_category[c_name]['y_true'].append(y_true[i])
+        res_by_category[c_name]['y_pred_prob'].append(y_pred_prob[i])
+        res_by_category[c_name]['indices'].append(i)
+
+    y_pred_bin_global = np.zeros(len(y_pred_prob), dtype=int)
+    
+    # 建立一个字典，用来存储这轮搜索到的最佳阈值
+    searched_thresholds = {}
+
+    for c, res in res_by_category.items():
+        cat_y_true = np.array(res['y_true'])
+        cat_y_pred_prob = np.array(res['y_pred_prob'])
+        
+        try:
+            cat_auc = roc_auc_score(cat_y_true, cat_y_pred_prob).round(4).tolist()
+        except ValueError:
+            cat_auc = 0
+            
+        # -------------------------------------------------------------
+        # 👑 核心逻辑分流：验证集搜索 VS 测试集盲测
+        # -------------------------------------------------------------
+        if not is_test:
+            # 模式 A: Validation (网格搜索最佳阈值)
+            best_f1 = 0
+            best_cat_thresh = 0.5
+            for th in np.arange(0.3, 0.71, 0.05):
+                preds_bin = (cat_y_pred_prob >= th).astype(int)
+                f1 = f1_score(cat_y_true, preds_bin, average='macro', zero_division=0)
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_cat_thresh = round(th, 2)
+            # 保存搜索到的最佳阈值
+            searched_thresholds[c] = best_cat_thresh
+        else:
+            # 模式 B: Test (绝对不搜索！直接套用 Validation 传来的阈值)
+            if thresholds_dict is not None and c in thresholds_dict:
+                best_cat_thresh = thresholds_dict[c]
+            else:
+                best_cat_thresh = 0.5 # 兜底安全策略
+        # -------------------------------------------------------------
+        
+        # 依照最终确定的阈值进行二值化
+        cat_y_pred_bin = (cat_y_pred_prob >= best_cat_thresh).astype(int)
+        
+        # 填回全局阵列
+        for idx, global_idx in enumerate(res['indices']):
+            y_pred_bin_global[global_idx] = cat_y_pred_bin[idx]
+            
+        if len(cat_y_true) > 0:
+            metrics_by_category[c] = {
+                'precision': precision_score(cat_y_true, cat_y_pred_bin, average='macro', zero_division=0).round(4).tolist(),
+                'recall': recall_score(cat_y_true, cat_y_pred_bin, average='macro', zero_division=0).round(4).tolist(),
+                'fscore': f1_score(cat_y_true, cat_y_pred_bin, average='macro', zero_division=0).round(4).tolist(),
+                'auc': cat_auc,
+                'acc': accuracy_score(cat_y_true, cat_y_pred_bin).round(4),
+                'best_thresh': best_cat_thresh 
+            }
+        else:
+            metrics_by_category[c] = {'precision': 0, 'recall': 0, 'fscore': 0, 'auc': 0, 'acc': 0, 'best_thresh': best_cat_thresh}
+
+    # 全局指标计算
+    try:
+        metrics_by_category['auc'] = roc_auc_score(y_true, y_pred_prob, average='macro')
+    except ValueError:
+        metrics_by_category['auc'] = 0
+
+    metrics_by_category['metric'] = f1_score(y_true, y_pred_bin_global, average='macro', zero_division=0)
+    metrics_by_category['recall'] = recall_score(y_true, y_pred_bin_global, average='macro', zero_division=0)
+    metrics_by_category['precision'] = precision_score(y_true, y_pred_bin_global, average='macro', zero_division=0)
+    metrics_by_category['acc'] = accuracy_score(y_true, y_pred_bin_global)
+
+    # Validation 会返回额外的阈值字典，Test 则只返回结果
+    if not is_test:
+        return metrics_by_category, y_pred_bin_global, searched_thresholds
+    else:
+        return metrics_by_category, y_pred_bin_global
+
+# =====================================================================
+# 包含真假新闻独立指标的包装函数
+# =====================================================================
+def metricsTrueFalse(y_true, y_pred_prob, category, category_dict, is_test=False, thresholds_dict=None):
+    
+    # 动态解包
+    if not is_test:
+        metrics_res, y_pred_bin_global, searched_thresholds = metrics(y_true, y_pred_prob, category, category_dict, is_test=False)
+    else:
+        metrics_res, y_pred_bin_global = metrics(y_true, y_pred_prob, category, category_dict, is_test=True, thresholds_dict=thresholds_dict)
+        
+    y_true_arr = np.array(y_true)
+    
+    fake = {
+        'precision': precision_score(y_true_arr, y_pred_bin_global, pos_label=1, zero_division=0),
+        'recall': recall_score(y_true_arr, y_pred_bin_global, pos_label=1, zero_division=0),
+        'F1': f1_score(y_true_arr, y_pred_bin_global, pos_label=1, zero_division=0)
+    }
+    real = {
+        'precision': precision_score(y_true_arr, y_pred_bin_global, pos_label=0, zero_division=0),
+        'recall': recall_score(y_true_arr, y_pred_bin_global, pos_label=0, zero_division=0),
+        'F1': f1_score(y_true_arr, y_pred_bin_global, pos_label=0, zero_division=0)
+    }
+    metrics_res['real'] = real
+    metrics_res['fake'] = fake
+    
+    # 将寻找出的阈值一并返回给主函数
+    if not is_test:
+        return metrics_res, searched_thresholds
+    else:
+        return metrics_res
+    
 def data2gpu(batch):
     batch_data = {
         'content': batch[0].cuda(),
@@ -27,175 +156,7 @@ def data2gpu(batch):
     }
     return batch_data
 
-class Averager():
-
-    def __init__(self):
-        self.n = 0
-        self.v = 0
-
-    def add(self, x):
-        self.v = (self.v * self.n + x) / (self.n + 1)
-        self.n += 1
-
-    def item(self):
-        return self.v
-
-"""
-def metrics(y_true, y_pred, category, category_dict):
-    res_by_category = {}
-    metrics_by_category = {}
-    reverse_category_dict = {}
-    for k, v in category_dict.items():
-        reverse_category_dict[v] = k
-        res_by_category[k] = {"y_true": [], "y_pred": []}
-
-    for i, c in enumerate(category):
-        c = reverse_category_dict[c]
-        res_by_category[c]['y_true'].append(y_true[i])
-        res_by_category[c]['y_pred'].append(y_pred[i])
-
-    for c, res in res_by_category.items():
-        try:
-            metrics_by_category[c] = {
-                'auc': roc_auc_score(res['y_true'], res['y_pred']).round(4).tolist()
-            }
-        except Exception as e:
-            metrics_by_category[c] = {
-                'auc': 0
-            }
-
-        metrics_by_category['auc'] = roc_auc_score(y_true, y_pred, average='macro')
-        y_pred = np.around(np.array(y_pred)).astype(int)
-        metrics_by_category['metric'] = f1_score(y_true, y_pred, average='macro')
-        metrics_by_category['recall'] = recall_score(y_true, y_pred, average='macro')
-        metrics_by_category['precision'] = precision_score(y_true, y_pred, average='macro')
-        metrics_by_category['acc'] = accuracy_score(y_true, y_pred)
-
-    for c, res in res_by_category.items():
-        try:
-            metrics_by_category[c] = {
-                'precision': precision_score(res['y_true'], np.around(np.array(res['y_pred'])).astype(int),
-                                             average='macro').round(4).tolist(),
-                'recall': recall_score(res['y_true'], np.around(np.array(res['y_pred'])).astype(int),
-                                       average='macro').round(4).tolist(),
-                'fscore': f1_score(res['y_true'], np.around(np.array(res['y_pred'])).astype(int),
-                                   average='macro').round(4).tolist(),
-                'auc': metrics_by_category[c]['auc'],
-                'acc': accuracy_score(res['y_true'], np.around(np.array(res['y_pred'])).astype(int)).round(4)
-            }
-        except Exception as e:
-            metrics_by_category[c] = {
-                'precision': 0,
-                'recall': 0,
-                'fscore': 0,
-                'auc': 0,
-                'acc': 0
-            }
-    return metrics_by_category
-"""
-
-def metricsTrueFalse(y_true, y_pred, category, category_dict):
-    y_GT = y_true
-    metricsTrueFalse = metrics(y_true, y_pred, category, category_dict)
-    fake = {}
-    real = {}
-    THRESH = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]
-    realnews_TP, realnews_TN, realnews_FP, realnews_FN = [0]*9, [0]*9, [0]*9, [0]*9
-    fakenews_TP, fakenews_TN, fakenews_FP, fakenews_FN = [0]*9, [0]*9, [0]*9, [0]*9
-    realnews_sum, fakenews_sum = [0] * 9, [0] * 9
-    for thresh_idx, thresh in enumerate(THRESH):
-        for i in range(len(y_pred)):
-            if y_pred[i]< thresh:y_pred[i]=0
-            else:y_pred[i]=1
-        for idx in range(len(y_pred)):
-            if y_GT[idx] == 1:
-                #  FAKE NEWS RESULT
-                fakenews_sum[thresh_idx] += 1
-                if y_pred[idx] == 0:
-                    fakenews_FN[thresh_idx] += 1
-                    realnews_FP[thresh_idx] += 1
-                else:
-                    fakenews_TP[thresh_idx] += 1
-                    realnews_TN[thresh_idx] += 1
-            else:
-                # REAL NEWS RESULT
-                realnews_sum[thresh_idx] += 1
-                if y_pred[idx] == 1:
-                    realnews_FN[thresh_idx] += 1
-                    fakenews_FP[thresh_idx] += 1
-                else:
-                    realnews_TP[thresh_idx] += 1
-                    fakenews_TN[thresh_idx] += 1
-
-    val_accuracy, real_accuracy, fake_accuracy, real_precision, fake_precision = [0] * 9, [0] * 9, [0] * 9, [0] * 9, [0] * 9
-    real_recall, fake_recall, real_F1, fake_F1 = [0] * 9, [0] * 9, [0] * 9, [0] * 9
-    for thresh_idx, _ in enumerate(THRESH):
-        val_accuracy[thresh_idx] = (realnews_TP[thresh_idx]+realnews_TN[thresh_idx])/(realnews_TP[thresh_idx]+realnews_TN[thresh_idx]+realnews_FP[thresh_idx]+realnews_FN[thresh_idx])
-        real_accuracy[thresh_idx] = (realnews_TP[thresh_idx])/realnews_sum[thresh_idx]
-        fake_accuracy[thresh_idx] = (fakenews_TP[thresh_idx])/fakenews_sum[thresh_idx]
-        real_precision[thresh_idx] = realnews_TP[thresh_idx]/max(1,(realnews_TP[thresh_idx]+realnews_FP[thresh_idx]))
-        fake_precision[thresh_idx] = fakenews_TP[thresh_idx] / max(1,(fakenews_TP[thresh_idx] + fakenews_FP[thresh_idx]))
-        real_recall[thresh_idx] = realnews_TP[thresh_idx]/max(1,(realnews_TP[thresh_idx]+realnews_FN[thresh_idx]))
-        fake_recall[thresh_idx] = fakenews_TP[thresh_idx] / max(1,(fakenews_TP[thresh_idx] + fakenews_FN[thresh_idx]))
-        real_F1[thresh_idx] = 2*(real_recall[thresh_idx]*real_precision[thresh_idx])/max(1,(real_recall[thresh_idx]+real_precision[thresh_idx]))
-        fake_F1[thresh_idx] = 2 * (fake_recall[thresh_idx] * fake_precision[thresh_idx]) / max(1,(fake_recall[thresh_idx] + fake_precision[thresh_idx]))
-    fake['precision'] =fake_precision[0]
-    fake['recall'] =fake_recall[0]
-    fake['F1'] =fake_F1[0]
-    real['precision'] =real_precision[0]
-    real['recall'] =real_recall[0]
-    real['F1'] =real_F1[0]
-    metricsTrueFalse['real']=real
-    metricsTrueFalse['fake'] = fake
-    return metricsTrueFalse
-
-def metrics(y_true, y_pred, category, category_dict):
-    res_by_category = {}
-    metrics_by_category = {}
-    reverse_category_dict = {}
-    for k, v in category_dict.items():
-        reverse_category_dict[v] = k
-        res_by_category[k] = {"y_true": [], "y_pred": []}
-
-    for i, c in enumerate(category):
-        c = reverse_category_dict[c]
-        res_by_category[c]['y_true'].append(y_true[i])
-        res_by_category[c]['y_pred'].append(y_pred[i])
-
-    for c, res in res_by_category.items():
-        try:
-            metrics_by_category[c] = {
-                'auc': roc_auc_score(res['y_true'], res['y_pred']).round(4).tolist()
-            }
-        except ValueError:
-            pass
-
-    try:
-        metrics_by_category['auc'] = roc_auc_score(y_true, y_pred, average='macro')
-    except ValueError:
-        pass
-    y_pred = np.around(np.array(y_pred)).astype(int)
-    metrics_by_category['metric'] = f1_score(y_true, y_pred, average='macro')
-    metrics_by_category['recall'] = recall_score(y_true, y_pred, average='macro')
-    metrics_by_category['precision'] = precision_score(y_true, y_pred, average='macro')
-    metrics_by_category['acc'] = accuracy_score(y_true, y_pred)
-
-    for c, res in res_by_category.items():
-        # precision, recall, fscore, support = precision_recall_fscore_support(res['y_true'], np.around(np.array(res['y_pred'])).astype(int), zero_division=0)
-        metrics_by_category[c] = {
-            'precision': precision_score(res['y_true'], np.around(np.array(res['y_pred'])).astype(int),
-                                         average='macro').round(4).tolist(),
-            'recall': recall_score(res['y_true'], np.around(np.array(res['y_pred'])).astype(int),
-                                   average='macro').round(4).tolist(),
-            'fscore': f1_score(res['y_true'], np.around(np.array(res['y_pred'])).astype(int), average='macro').round(
-                4).tolist(),
-
-            #'auc': metrics_by_category[c]['auc'],
-            'acc': accuracy_score(res['y_true'], np.around(np.array(res['y_pred'])).astype(int)).round(4)
-        }
-    return metrics_by_category
 class Recorder():
-
     def __init__(self, early_step):
         self.max = {'metric': 0}
         self.cur = {'metric': 0}
