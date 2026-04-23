@@ -1,4 +1,5 @@
 import os
+import os
 import tqdm
 import torch
 from positional_encodings.torch_encodings import PositionalEncoding1D, PositionalEncoding2D, PositionalEncodingPermute3D
@@ -14,24 +15,43 @@ from timm.models.vision_transformer import Block
 import cn_clip.clip as clip
 from cn_clip.clip import load_from_name, available_models
 import torch.nn.functional as F
+from transformers import get_cosine_schedule_with_warmup
+import sys
+try:
+    import longclip
+except ImportError:
+    pass
 
-# --- 【ARL 1/3】: 梯度缩放层 ---
+# --- 【ARL 1/3】: 样本级别梯度缩放层 ---
 class GradScale(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, weight):
-        # 前向传播不做修改，但必须保存 weight 供反向传播使用
-        ctx.save_for_backward(weight)
+    def forward(ctx, input, weight_dict, modality):
+        # 核心技巧：只保存字典的引用和当前模态，不直接保存 tensor
+        # 这样就能在 backward 发生前，随时更新字典里面的值
+        ctx.weight_dict = weight_dict
+        ctx.modality = modality
         return input
 
     @staticmethod
     def backward(ctx, grad_output):
-        # 取出前向传播保存的权重
-        weight = ctx.saved_tensors[0]
-        # 【核心逻辑】：梯度 = 原始梯度 * (1 + weight)
-        # weight 越大，该模态获得的梯度越大，学习越快
+        # 取出计算好的样本级权重 (Shape: [batch_size])
+        weight = ctx.weight_dict[ctx.modality]
+        
+        if isinstance(weight, float) or weight.dim() == 0:
+            return grad_output, None, None
+            
+        reshape_dim = [-1] + [1] * (grad_output.dim() - 1)
+        weight = weight.view(*reshape_dim)
+        
+        # 原始计算
         grad_input = grad_output + grad_output * weight
-        # weight 本身不需要梯度，所以返回 None
-        return grad_input, None
+        
+        # 【新增：局部防爆閥】
+        # 將 NaN 轉為 0，將正負無窮大 (inf) 限制在 ±10.0 的安全範圍
+        # 這完全不會影響 ARL 正常的動態調整，但能 100% 擋住毀滅性的梯度爆炸
+        grad_input = torch.nan_to_num(grad_input, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        return grad_input, None, None
 # --------------------------------------
 
 class SimpleGate(nn.Module):
@@ -73,21 +93,23 @@ class AdaIN(nn.Module):
 
 
 class MultiDomainPLEFENDModel(torch.nn.Module):
-    def __init__(self, emb_dim, mlp_dims, bert, out_channels, dropout):
+    def __init__(self, emb_dim, mlp_dims, bert, out_channels, dropout, domain_num=9, dataset='weibo21'):
         super(MultiDomainPLEFENDModel, self).__init__()
         
         # --- 【ARL 新增代码 2/3 - Part A】: 初始化 ARL 参数 ---
-        # 使用 register_buffer 确保这些参数随模型保存/移动到GPU，但不是可训练参数
-        self.register_buffer('text_weight', torch.tensor(0.0))
-        self.register_buffer('image_weight', torch.tensor(0.0))
+        
+        # 改用 dict 來儲存當前 batch 的樣本級權重，解決時間差問題
+        self.arl_weights = {'text': 0.0, 'image': 0.0}
         
         # ARL 超参数设定
         self.arl_start_epoch = 2 # 默认第n轮后才开始 ARL，前期让模型自由预热
         self.current_epoch = 0   # 记录当前轮次
         # --------------------------------------------------
         
-        self.num_expert = 6
-        self.domain_num = 9
+        self.num_expert = 4
+        #self.domain_num = 9
+        # 動態獲取領域數量 (Weibo21 是 9，FineFake 是 7)
+        self.domain_num = domain_num
         self.gate_num = 10
         self.num_share = 1
         self.unified_dim, self.text_dim = emb_dim, 768
@@ -287,7 +309,15 @@ class MultiDomainPLEFENDModel(torch.nn.Module):
         self.MLP_fusion = MLP_fusion(960, 320, [348], 0.1)
         self.domain_fusion = MLP_fusion(1088, 320, [348], 0.1)
         self.MLP_fusion0 = MLP_fusion(768 * 2, 768, [348], 0.1)
-        self.clip_fusion = clip_fuion(1024, 320, [348], 0.1)
+        #self.clip_fusion = clip_fuion(1024, 320, [348], 0.1)
+        # 动态适配 CLIP 拼接后的维度
+        # LONG-CLIP(L) 提取的特征是 768维，拼接后 1536
+        # CN-CLIP(B) 提取的特征是 512维，拼接后 1024
+        if dataset == 'finefake':
+            self.clip_fusion = clip_fuion(1536, 320, [348], 0.1)
+        else:
+            self.clip_fusion = clip_fuion(1024, 320, [348], 0.1)
+        # ==============================================================
 
 
         self.model_size = "base"
@@ -352,12 +382,26 @@ class MultiDomainPLEFENDModel(torch.nn.Module):
         for i in range(self.domain_num):
             self.irrelevant_tensor.append(nn.Parameter(torch.ones((1, 320)), requires_grad=True))
         
-        # 原始代码
+        '''# 原始代码
         self.ClipModel,_ = load_from_name("ViT-B-16", device="cuda", download_root='./')
         
         # 修改为：
         self.ClipModel, _ = load_from_name("ViT-B-16", device="cuda", download_root='./')
         self.ClipModel = self.ClipModel.float() # 强制转换为 float32 以支持微调
+        '''
+        # 將上述舊代碼替換為你提供的這段動態邏輯：
+        if dataset == 'finefake':
+            print("⚙️ 模型檢測到 FineFake，正在掛載 LONG-CLIP 視覺特徵提取器...")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            # 注意：這裡呼叫的是 longclip
+            import longclip 
+            self.ClipModel, _ = longclip.load("./longclip-L.pt", device=device)
+            self.ClipModel = self.ClipModel.float()
+        else:
+            print("⚙️ 模型檢測到 Weibo/Weibo21，正在掛載 CN-CLIP 視覺特徵提取器...")
+            from cn_clip.clip import load_from_name
+            self.ClipModel, _ = load_from_name("ViT-B-16", device="cuda", download_root='./')
+            self.ClipModel = self.ClipModel.float()
 
 
         #pivot:
@@ -490,11 +534,10 @@ class MultiDomainPLEFENDModel(torch.nn.Module):
         image_feature = self.image_model.forward_ying(image)  # ([64, 197, 768])
         #image_feature = self.bert(inputs, attention_mask=masks)[0]
         
-        # --- 【ARL 新增代码 2/3 - Part B】: 应用梯度调制 ---
-        # 只有在训练模式且达到启动轮次后才应用
+        # --- 【ARL 新增代码 2/3 - Part B】: 应用梯度调制 (样本级) ---
         if self.training and self.current_epoch >= self.arl_start_epoch:
-            text_feature = GradScale.apply(text_feature, self.text_weight)
-            image_feature = GradScale.apply(image_feature, self.image_weight)
+            text_feature = GradScale.apply(text_feature, self.arl_weights, 'text')
+            image_feature = GradScale.apply(image_feature, self.arl_weights, 'image')
         # ------------------------------------------------
         # ---------------- 原始代码 ----------------
         #clip_image = kwargs['clip_image']
@@ -522,11 +565,11 @@ class MultiDomainPLEFENDModel(torch.nn.Module):
         clip_image_feature = clip_image_feature / clip_image_feature.norm(dim=-1, keepdim=True)
         clip_text_feature = clip_text_feature / clip_text_feature.norm(dim=-1, keepdim=True)
 
-        # 3. 【核心新增】：复用 ARL 权重对 CLIP 的图/文单边特征进行梯度调制
+        # 3. 【核心新增】：复用 ARL 权重对 CLIP 的图/文单边特征进行梯度调制 (样本级)
         if self.training and self.current_epoch >= self.arl_start_epoch:
-            clip_text_feature = GradScale.apply(clip_text_feature, self.text_weight)
-            clip_image_feature = GradScale.apply(clip_image_feature, self.image_weight)
-
+            clip_text_feature = GradScale.apply(clip_text_feature, self.arl_weights, 'text')
+            clip_image_feature = GradScale.apply(clip_image_feature, self.arl_weights, 'image')
+            
         # 4. 拼接并输入融合层
         clip_fusion_feature = torch.cat((clip_image_feature, clip_text_feature), dim=-1)
         clip_fusion_feature = self.clip_fusion(clip_fusion_feature.float())
@@ -663,8 +706,9 @@ class MultiDomainPLEFENDModel(torch.nn.Module):
             text_label_pred_list.append(text_label_pred[i][idxs.squeeze() == i])
             text_label_pred_avg += text_label_pred[i]
         text_label_pred_avg = text_label_pred_avg / 8
-        text_label_pred_list = torch.cat((text_label_pred_list[0], text_label_pred_list[1], text_label_pred_list[2], text_label_pred_list[3],
-                                     text_label_pred_list[4], text_label_pred_list[5], text_label_pred_list[6], text_label_pred_list[7], text_label_pred_list[8]))
+        '''text_label_pred_list = torch.cat((text_label_pred_list[0], text_label_pred_list[1], text_label_pred_list[2], text_label_pred_list[3],
+                                     text_label_pred_list[4], text_label_pred_list[5], text_label_pred_list[6], text_label_pred_list[7], text_label_pred_list[8]))'''
+        text_label_pred_list = torch.cat(text_label_pred_list, dim=0)
         #image
         image_only_output = []
         image_label_pred = []
@@ -683,8 +727,9 @@ class MultiDomainPLEFENDModel(torch.nn.Module):
             image_label_pred_avg += image_label_pred[i]
         image_label_pred_avg = image_label_pred_avg / 8
 
-        image_label_pred_list = torch.cat((image_label_pred_list[0], image_label_pred_list[1], image_label_pred_list[2], image_label_pred_list[3],
-                                     image_label_pred_list[4], image_label_pred_list[5], image_label_pred_list[6], image_label_pred_list[7], image_label_pred_list[8]))
+        '''image_label_pred_list = torch.cat((image_label_pred_list[0], image_label_pred_list[1], image_label_pred_list[2], image_label_pred_list[3],
+                                     image_label_pred_list[4], image_label_pred_list[5], image_label_pred_list[6], image_label_pred_list[7], image_label_pred_list[8]))'''
+        image_label_pred_list = torch.cat(image_label_pred_list, dim=0)
         # fusion
         fusion_only_output = []
         fusion_label_pred = []
@@ -702,10 +747,11 @@ class MultiDomainPLEFENDModel(torch.nn.Module):
             fusion_label_pred_list.append(fusion_label_pred[i][idxs.squeeze() == i])
             fusion_label_pred_avg += fusion_label_pred[i]
         fusion_label_pred_avg = fusion_label_pred_avg / 9
-        fusion_label_pred_list = torch.cat(
+        '''fusion_label_pred_list = torch.cat(
             (fusion_label_pred_list[0], fusion_label_pred_list[1], fusion_label_pred_list[2], fusion_label_pred_list[3],
              fusion_label_pred_list[4], fusion_label_pred_list[5], fusion_label_pred_list[6],
-             fusion_label_pred_list[7],fusion_label_pred_list[8]))
+             fusion_label_pred_list[7],fusion_label_pred_list[8]))'''
+        fusion_label_pred_list = torch.cat(fusion_label_pred_list, dim=0)
         # pivot fusion
         text_gate_share_expert_value = text_gate_share_expert_value[0]
         image_gate_share_expert_value = image_gate_share_expert_value[0]
@@ -782,8 +828,9 @@ class MultiDomainPLEFENDModel(torch.nn.Module):
             final_label_pred_list.append(final_label_pred[i][idxs.squeeze() == i])
             final_label_pred_avg += final_label_pred[i]
         final_label_pred_avg = final_label_pred_avg / 9
-        final_label_pred_list = torch.cat((final_label_pred_list[0], final_label_pred_list[1], final_label_pred_list[2], final_label_pred_list[3],
-                                     final_label_pred_list[4], final_label_pred_list[5], final_label_pred_list[6], final_label_pred_list[7],final_label_pred_list[8]))
+        '''final_label_pred_list = torch.cat((final_label_pred_list[0], final_label_pred_list[1], final_label_pred_list[2], final_label_pred_list[3],
+                                     final_label_pred_list[4], final_label_pred_list[5], final_label_pred_list[6], final_label_pred_list[7],final_label_pred_list[8]))'''
+        final_label_pred_list = torch.cat(final_label_pred_list, dim=0)
 
 
 
@@ -805,6 +852,7 @@ class Trainer():
                  category_dict,
                  weight_decay,
                  save_param_dir,
+                 dataset='weibo21',
                  loss_weight=[1, 0.006, 0.009, 5e-5],
                  early_stop=5,
                  epoches=100,
@@ -828,18 +876,26 @@ class Trainer():
         self.arl_gamma = arl_gamma
         self.arl_T = arl_T
         self.pkl_name = pkl_name
+        self.dataset = dataset
         # -----------------------------------
         self.emb_dim = emb_dim
         self.mlp_dims = mlp_dims
         self.bert = bert
         self.dropout = dropout
+        #if not os.path.exists(save_param_dir):
+            #self.save_param_dir = os.makedirs(save_param_dir)
+        #else:
+            #self.save_param_dir = save_param_dir
+            
+        # ---------- 修复后的正确代码 ----------
         if not os.path.exists(save_param_dir):
-            self.save_param_dir = os.makedirs(save_param_dir)
-        else:
-            self.save_param_dir = save_param_dir
+            os.makedirs(save_param_dir)
+            
+        self.save_param_dir = save_param_dir
 
     def train(self):
-        self.model = MultiDomainPLEFENDModel(self.emb_dim, self.mlp_dims, self.bert, 320, self.dropout)
+        self.model = MultiDomainPLEFENDModel(self.emb_dim, self.mlp_dims, self.bert, 320, self.dropout,domain_num=len(self.category_dict), 
+            dataset=self.dataset)
         if self.use_cuda:
             self.model = self.model.cuda()
         loss_fn = torch.nn.BCELoss()
@@ -887,9 +943,21 @@ class Trainer():
             {'params': self.model.ClipModel.parameters(), 'lr': 1e-6, 'weight_decay': 1e-2}
         ])
         # ================================================
-        
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.98)
+        # 假設你每個 epoch 有 len(train_loader) 個 step，總共跑 35 個 epoch (考慮到早停，預設 35 比較合理)
+        total_steps = len(self.train_loader) * 25 
+        # 預熱期佔總步數的 10%
+        warmup_steps = int(total_steps * 0.1)
+
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, 
+            num_warmup_steps=warmup_steps, 
+            num_training_steps=total_steps
+        )
+        #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epoches, eta_min=1e-7)
+        #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.98)
         recorder = Recorder(self.early_stop)
+        
+        accumulation_steps = 4
         
         # --- [修改片段 8 修改]: 替換原本寫死的變數 ---
         arl_T = self.arl_T 
@@ -909,143 +977,170 @@ class Trainer():
                 label = batch_data['label']
                 category = batch_data['category']
                 idxs = torch.tensor([index for index in category]).view(-1, 1)
-                batch_label = torch.cat((label[idxs.squeeze() == 0], label[idxs.squeeze() == 1],
+                '''batch_label = torch.cat((label[idxs.squeeze() == 0], label[idxs.squeeze() == 1],
                                          label[idxs.squeeze() == 2], label[idxs.squeeze() == 3],
                                          label[idxs.squeeze() == 4], label[idxs.squeeze() == 5],
-                                         label[idxs.squeeze() == 6], label[idxs.squeeze() == 7],label[idxs.squeeze() == 8]))
+                                         label[idxs.squeeze() == 6], label[idxs.squeeze() == 7],label[idxs.squeeze() == 8]))'''
+                batch_label = torch.cat([label[idxs.squeeze() == i] for i in range(self.model.domain_num)])
 
                 final_label_pred_list,fusion_label_pred_list,image_label_pred_list,text_label_pred_list = self.model(**batch_data)
                 
     
-                # --- ARL: 动态权重计算逻辑 ---
+                # --- ARL: 动态权重计算逻辑 (纯样本级别) ---
                 if epoch >= self.model.arl_start_epoch:
                     with torch.no_grad(): # 计算权重过程不需要梯度
                         
-                        # A. 获取两个模态的预测概率 (进行极小值截断防止 NaN)
+                        # A. 获取概率 (Shape: [batch_size])
                         p_text = torch.clamp(text_label_pred_list, 1e-6, 1-1e-6)
                         p_image = torch.clamp(image_label_pred_list, 1e-6, 1-1e-6)
                         
-                        # B. 计算二元熵 (Entropy) - 衡量"不确定性"
-                        # 公式: H(p) = -p*log(p) - (1-p)*log(1-p)
+                        # B. 计算每个样本的信息熵 (Shape: [batch_size])
                         H_text = - (p_text * torch.log(p_text) + (1-p_text) * torch.log(1-p_text))
                         H_image = - (p_image * torch.log(p_image) + (1-p_image) * torch.log(1-p_image))
                         
-                        # 取 batch 均值
-                        H_t_mean = H_text.mean().item()
-                        H_i_mean = H_image.mean().item()
-                        
-                        # C. 计算可靠性 (Reliability) - 加入截断保护
-                        # 1. 计算相对熵占比 (Relative Entropy Ratio)
-                        sum_H = H_t_mean + H_i_mean + 1e-8
-                        h_t_ratio = H_t_mean / sum_H
-                        h_i_ratio = H_i_mean / sum_H
+                        # C. 计算样本级可靠性 (Shape: [batch_size])
+                        sum_H = H_text + H_image + 1e-8
+                        # 对每个样本的占比进行截断保护，防止极端值
+                        h_t_ratio = torch.clamp(H_text / sum_H, min=0.3)
+                        h_i_ratio = torch.clamp(H_image / sum_H, min=0.3)
 
-                        # 2. 【关键】强制截断 (Clamping)
-                        # ARL 源码逻辑: H_a = clamp(H_a_n, 0.3)
-                        # 作用：无论一个模态表现多好(熵多低)，其在权重计算中的"不确定性占比"最低只能是 0.3
-                        # 这防止了权重差异被拉大到无穷大 (例如防止出现 0.01 vs 0.99)
-                        h_t_ratio = max(0.3, h_t_ratio)
-                        h_i_ratio = max(0.3, h_i_ratio)
-
-                        # 3. 计算可靠性 (熵占比的倒数)
-                        # 占比越小(越接近0.3) -> 倒数越大 -> 权重越高
                         r_text = 1.0 / h_t_ratio
                         r_image = 1.0 / h_i_ratio
                         
-                        # 4. 归一化可靠性权重
                         r_sum = r_text + r_image
                         w_t_norm = r_text / r_sum
                         w_i_norm = r_image / r_sum
                         
-                        # D. 计算置信度 (Confidence) - 预测值的均值幅度
-                        conf_text = p_text.mean().item()
-                        conf_image = p_image.mean().item()
+                        # D. 计算样本级置信度 (Shape: [batch_size])
+                        # 对于二分类，预测概率距离 0.5 越远置信度越高（即 max(p, 1-p)）
+                        conf_text = torch.max(p_text, 1.0 - p_text)
+                        conf_image = torch.max(p_image, 1.0 - p_image)
                         
-                        # E. 【ARL 核心非对称交叉加权】
-                        # 文本的梯度权重 = 图像的置信度 * 文本自身的可靠性 * 温度系数
-                        # 逻辑：利用强模态(高置信度)来指导可靠模态的学习
+                        # E. 交叉调制 Logits (Shape: [batch_size])
                         logit_text = (conf_image * w_t_norm) * arl_T
                         logit_image = (conf_text * w_i_norm) * arl_T
                         
-                        # F. Softmax 归一化得到最终调制系数
-                        weights = F.softmax(torch.tensor([logit_text, logit_image]).cuda(), dim=0)
+                        # F. Softmax 得到每个样本的最终权重
+                        logits = torch.stack([logit_text, logit_image], dim=0) # [2, batch_size]
+                        weights = F.softmax(logits, dim=0) # [2, batch_size]
                         
-                        # G. 更新到模型中 (将在下一个 Batch 的 GradScale 中生效)
-                        self.model.text_weight = weights[0]
-                        self.model.image_weight = weights[1]
+                        # G. 实时写入字典！
+                        # 这个操作发生在 loss.backward() 之前
+                        # 因此接下来的 backward 就能无缝读取到属于这批样本的独立权重
+                        self.model.arl_weights['text'] = weights[0].detach()  # [batch_size]
+                        self.model.arl_weights['image'] = weights[1].detach() # [batch_size]
                         
-                        # 每 50 个 step 打印一次日志 (类似 ARL 源码)
                         if step_n % 50 == 0:
-                            # 1. 计算当前 Batch 的简单准确率 (用于监控)
-                            # MMDFND 是二分类/多标签任务，阈值取 0.5
                             acc_text = ((text_label_pred_list > 0.5).float() == batch_label.float()).float().mean().item()
                             acc_image = ((image_label_pred_list > 0.5).float() == batch_label.float()).float().mean().item()
-                            
-                            print(f"\n[ARL Monitor] Epoch {epoch} Step {step_n}")
-                            print(f"  > Accuracy  | Text: {acc_text:.4f} | Image: {acc_image:.4f}")
-                            print(f"  > Entropy   | Text: {H_t_mean:.4f} | Image: {H_i_mean:.4f} (Larger = More Uncertain)")
-                            print(f"  > Confidence| Text: {conf_text:.4f} | Image: {conf_image:.4f}")
-                            print(f"  > Reliability Weights (Variance-based) | Text: {w_t_norm:.4f} | Image: {w_i_norm:.4f}")
-                            print(f"  > Final Gradient Weights (Softmax)     | Text: {weights[0].item():.4f} | Image: {weights[1].item():.4f}")
+                            print(f"\n[ARL Monitor - Sample Level] Epoch {epoch} Step {step_n}")
+                            print(f"  > Batch Accuracy      | Text: {acc_text:.4f} | Image: {acc_image:.4f}")
+                            print(f"  > Batch Avg Entropy   | Text: {H_text.mean().item():.4f} | Image: {H_image.mean().item():.4f}")
+                            print(f"  > Batch Avg Confidence| Text: {conf_text.mean().item():.4f} | Image: {conf_image.mean().item():.4f}")
+                            # 打印第一个样本的权重作为直观参考
+                            print(f"  > Sample 0 Weight     | Text: {weights[0][0].item():.4f} | Image: {weights[1][0].item():.4f}")
                             print("-" * 60)
-                
-                # --- 【核心修复：防止过度自信导致 BCELoss 梯度除以 0 产生 NaN】 ---
-                final_label_pred_list = torch.clamp(final_label_pred_list, min=1e-5, max=1.0 - 1e-5)
-                fusion_label_pred_list = torch.clamp(fusion_label_pred_list, min=1e-5, max=1.0 - 1e-5)
-                image_label_pred_list = torch.clamp(image_label_pred_list, min=1e-5, max=1.0 - 1e-5)
-                text_label_pred_list = torch.clamp(text_label_pred_list, min=1e-5, max=1.0 - 1e-5)
-                # -----------------------------------------------------------
-                
                 #-------------------------------原损失逻辑--------------------------------
-                loss0 = loss_fn(final_label_pred_list, batch_label.float())
-                loss1 = loss_fn(fusion_label_pred_list, batch_label.float())
-                loss2 = loss_fn(image_label_pred_list, batch_label.float())
-                loss3 = loss_fn(text_label_pred_list, batch_label.float())
-                #loss = 0.7*loss0+0.1*loss1+0.1*loss2+0.1*loss3
-                #---------------------------------------------------------------
-                loss_main = 0.7 * loss0 + 0.1 * loss1 # 融合相关的 Loss
-                loss_aux  = loss2 + loss3             # 单模态 Loss (Image + Text)
                 
-                # 总 Loss = 主 Loss + gamma * 单模态 Loss
+                
+                # 1. 如果模型输出已经崩坏产生 NaN，强制重置为 0.5（中立值，梯度为 0，防止连环崩溃）
+                safe_final_pred = torch.nan_to_num(final_label_pred_list, nan=0.5)
+                safe_fusion_pred = torch.nan_to_num(fusion_label_pred_list, nan=0.5)
+                safe_image_pred = torch.nan_to_num(image_label_pred_list, nan=0.5)
+                safe_text_pred = torch.nan_to_num(text_label_pred_list, nan=0.5)
+
+                # 2. 严格限制在 [1e-6, 1 - 1e-6] 之间，绝对满足 BCELoss 的底层 C++ 校验
+                safe_final_pred = torch.clamp(safe_final_pred, min=1e-6, max=1.0 - 1e-6)
+                safe_fusion_pred = torch.clamp(safe_fusion_pred, min=1e-6, max=1.0 - 1e-6)
+                safe_image_pred = torch.clamp(safe_image_pred, min=1e-6, max=1.0 - 1e-6)
+                safe_text_pred = torch.clamp(safe_text_pred, min=1e-6, max=1.0 - 1e-6)
+
+                # 3. 计算 Loss (必须使用 safe_ 开头的变量！)
+                loss0 = loss_fn(safe_final_pred, batch_label.float())
+                loss1 = loss_fn(safe_fusion_pred, batch_label.float())
+                loss2 = loss_fn(safe_image_pred, batch_label.float())
+                loss3 = loss_fn(safe_text_pred, batch_label.float())
+                
+                loss_main = 0.7 * loss0 + 0.1 * loss1
+                loss_aux  = loss2 + loss3
                 loss = loss_main + arl_gamma * loss_aux
+                # --------------------------------------------------------------------
                 
-                optimizer.zero_grad()
+                '''optimizer.zero_grad()
                 loss.backward()
+                
+                # 【保险丝】：在反向传播后，强行清理可能变成 NaN 的梯度
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        torch.nan_to_num_(p.grad, nan=0.0, posinf=10.0, neginf=-10.0)
+                        
                 optimizer.step()
                 if (scheduler is not None):
                     scheduler.step()
-                avg_loss.add(loss.item())
+                avg_loss.add(loss.item())'''
+                # 【修改 1】：將 loss 除以累加步數，保證累積後的梯度平均值與原來一致
+                loss = loss / accumulation_steps
+                
+                # 【修改 2】：直接 backward() 累積梯度，注意這裡去掉了前面的 zero_grad()
+                loss.backward()
+                
+                # 【保險絲】：在反向傳播後，強行清理可能變成 NaN 的梯度
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        torch.nan_to_num_(p.grad, nan=0.0, posinf=10.0, neginf=-10.0)
+                
+                # 【修改 3】：只有當累積達到指定步數，或是這個 epoch 的最後一個 batch 時，才更新權重
+                if (step_n + 1) % accumulation_steps == 0 or (step_n + 1) == len(train_data_iter):
+                    optimizer.step()
+                    optimizer.zero_grad() # 權重更新後，清空梯度，準備下一輪累積
+                    if (scheduler is not None):
+                        scheduler.step()
+                        
+                # 紀錄 loss 時要乘回來，確保終端機打印的 loss 數值是真實的
+                avg_loss.add(loss.item() * accumulation_steps)
             print('Training Epoch {}; Loss {}; '.format(epoch + 1, avg_loss.item()))
-            results0, results1, results2, results3 = self.test(self.val_loader)
             
-            # 【重要修改：措施一】验证集跑完后，立即强制清理显存
-            # 这能释放验证集产生的巨大临时 Tensor，防止下一轮 OOM
+            # 1. 執行 Validation (開啟搜索模式 is_test=False)
+            # metrics_tuple 包含 4 個預測結果，thresholds_tuple 包含 4 個對應的最佳閾值字典
+            metrics_tuple, thresholds_tuple = self.test(self.val_loader, is_test=False)
+            results0, results1, results2, results3 = metrics_tuple
+            
+            # 【重要修改：措施一】驗證集跑完後，立即強制清理顯存
             torch.cuda.empty_cache()
             
             mark = recorder.add(results0)
             if mark == 'save':
                 torch.save(self.model.state_dict(),
-                           # --- [修改片段 9 修改]: 使用動態命名的 pkl ---
                            os.path.join(self.save_param_dir, self.pkl_name))
-                           # -----------------------------------------
+                
+                # 👑 【核心新增】：儲存當前表現最好的這組閾值字典！
+                self.best_thresholds = thresholds_tuple
+                print(f"🌟 已更新最佳閾值: {self.best_thresholds[0]}")
+                
             elif mark == 'esc':
                 break
             else:
                 continue
-        # --- [修改片段 10 修改]: 載入時同樣使用動態命名的 pkl ---
-        self.model.load_state_dict(torch.load(os.path.join(self.save_param_dir, self.pkl_name)))
-        # ----------------------------------------------------
-        results0,results1,results2,results3 = self.test(self.test_loader)
-        print(results0)
-        return results0, os.path.join(self.save_param_dir, 'parameter_clip111.pkl')
 
-    def test(self, dataloader):
-        pred0 = []
-        pred1 = []
-        pred2 = []
-        pred3 = []
-        label1 = []
-        category = []
+        # 載入表現最好的模型權重
+        self.model.load_state_dict(torch.load(os.path.join(self.save_param_dir, self.pkl_name)))
+        
+        print("\n" + "="*50)
+        print("🚀 正在測試集上進行嚴格盲測 (使用 Validation 最佳閾值)...")
+        print("="*50)
+        
+        # 2. 執行 Test (開啟盲測模式 is_test=True，並傳入剛才儲存的黃金閾值)
+        results_tuple = self.test(self.test_loader, is_test=True, thresholds_dicts=self.best_thresholds)
+        results0, results1, results2, results3 = results_tuple
+        
+        print(results0)
+        return results0, os.path.join(self.save_param_dir, self.pkl_name)
+
+    # =================== 完全替換 test 方法 ===================
+    def test(self, dataloader, is_test=False, thresholds_dicts=None):
+        pred0, pred1, pred2, pred3 = [], [], [], []
+        label1, category = [], []
+        
         self.model.eval()
         data_iter = tqdm.tqdm(dataloader)
         for step_n, batch in enumerate(data_iter):
@@ -1053,20 +1148,18 @@ class Trainer():
                 batch_data = clipdata2gpu(batch)
                 label = batch_data['label']
                 batch_category = batch_data['category']
-                final_label_pred_list,fusion_label_pred_list,image_label_pred_list,text_label_pred_list= self.model(**batch_data)
+                final_label_pred_list, fusion_label_pred_list, image_label_pred_list, text_label_pred_list = self.model(**batch_data)
+                
+                # 防止 NaN 進入 sklearn 導致拋出異常
+                batch_label_pred0 = torch.nan_to_num(final_label_pred_list, nan=0.5)
+                batch_label_pred1 = torch.nan_to_num(fusion_label_pred_list, nan=0.5)
+                batch_label_pred2 = torch.nan_to_num(image_label_pred_list, nan=0.5)
+                batch_label_pred3 = torch.nan_to_num(text_label_pred_list, nan=0.5)
 
                 idxs = torch.tensor([index for index in batch_category]).view(-1, 1)
-                batch_label_pred0 = final_label_pred_list
-                batch_label_pred1 = fusion_label_pred_list
-                batch_label_pred2 = image_label_pred_list
-                batch_label_pred3 = text_label_pred_list
-
-
-                batch_label = torch.cat((label[idxs.squeeze() == 0], label[idxs.squeeze() == 1],
-                                         label[idxs.squeeze() == 2], label[idxs.squeeze() == 3],
-                                         label[idxs.squeeze() == 4], label[idxs.squeeze() == 5],
-                                         label[idxs.squeeze() == 6], label[idxs.squeeze() == 7],label[idxs.squeeze() == 8]))
+                batch_label = torch.cat([label[idxs.squeeze() == i] for i in range(self.model.domain_num)])
                 batch_category = torch.sort(batch_category).values
+                
                 label1.extend(batch_label.detach().cpu().numpy().tolist())
                 pred0.extend(batch_label_pred0.detach().cpu().numpy().tolist())
                 pred1.extend(batch_label_pred1.detach().cpu().numpy().tolist())
@@ -1074,4 +1167,26 @@ class Trainer():
                 pred3.extend(batch_label_pred3.detach().cpu().numpy().tolist())
                 category.extend(batch_category.detach().cpu().numpy().tolist())
 
-        return metricsTrueFalse(label1, pred0, category, self.category_dict),metricsTrueFalse(label1, pred1, category, self.category_dict),metricsTrueFalse(label1, pred2, category, self.category_dict),metricsTrueFalse(label1, pred3, category, self.category_dict)
+        # -------------------------------------------------------------
+        # 👑 呼叫 utils 進行指標計算與閾值處理
+        # -------------------------------------------------------------
+        if not is_test:
+            # Validation 模式：回傳 (成績, 搜到的閾值)
+            res0, t0 = metricsTrueFalse(label1, pred0, category, self.category_dict, is_test=False)
+            res1, t1 = metricsTrueFalse(label1, pred1, category, self.category_dict, is_test=False)
+            res2, t2 = metricsTrueFalse(label1, pred2, category, self.category_dict, is_test=False)
+            res3, t3 = metricsTrueFalse(label1, pred3, category, self.category_dict, is_test=False)
+            
+            return (res0, res1, res2, res3), (t0, t1, t2, t3)
+        
+        else:
+            # Test 模式：解包傳入的閾值，並嚴禁搜索
+            t0, t1, t2, t3 = thresholds_dicts if thresholds_dicts else (None, None, None, None)
+            
+            res0 = metricsTrueFalse(label1, pred0, category, self.category_dict, is_test=True, thresholds_dict=t0)
+            res1 = metricsTrueFalse(label1, pred1, category, self.category_dict, is_test=True, thresholds_dict=t1)
+            res2 = metricsTrueFalse(label1, pred2, category, self.category_dict, is_test=True, thresholds_dict=t2)
+            res3 = metricsTrueFalse(label1, pred3, category, self.category_dict, is_test=True, thresholds_dict=t3)
+            
+            return (res0, res1, res2, res3)
+
